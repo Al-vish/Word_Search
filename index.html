@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Lexicon // Compass</title>
+    
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://unpkg.com/framer-motion@10.16.4/dist/framer-motion.js"></script>
+
+    <script type="module">
+        import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.16.0';
+        window.AI = { pipeline, env };
+        env.allowLocalModels = false; 
+        env.useBrowserCache = true;
+    </script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+        
+        body { background: #000; color: #fff; font-family: 'Inter', sans-serif; overflow: hidden; touch-action: none; }
+        
+        /* The Compass Grid */
+        .grid-layer {
+            position: absolute; inset: 0; pointer-events: none;
+            background-image: 
+                linear-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+            background-size: 150px 150px;
+            background-position: center;
+            mask-image: radial-gradient(circle at center, black 0%, transparent 80%);
+        }
+
+        .axis-label {
+            position: absolute;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.2em;
+            color: rgba(255, 255, 255, 0.4);
+            background: #000;
+            padding: 4px 8px;
+            border-radius: 4px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .glass-panel {
+            background: rgba(15, 15, 15, 0.9);
+            backdrop-filter: blur(20px);
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 -20px 50px rgba(0,0,0,0.5);
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script id="worker-js" type="javascript/worker">
+        let vectors = null; 
+        let count = 0;
+        let dim = 384;      
+        
+        // The Four Poles of the Compass
+        let AXIS_INDICES = {
+            formal: -1, casual: -1,
+            intense: -1, mild: -1
+        };
+        
+        let AXIS_VECS = {};
+
+        function dot(idx, vecB) {
+            let sum = 0;
+            let offset = idx * dim;
+            for(let i=0; i<dim; i++) sum += vectors[offset+i] * vecB[i];
+            return sum;
+        }
+
+        function getVec(idx) {
+            const v = new Float32Array(dim);
+            const offset = idx * dim;
+            for(let i=0; i<dim; i++) v[i] = vectors[offset+i] / 127.0;
+            return v;
+        }
+
+        // Project: (Word . Pos) - (Word . Neg)
+        function project(idx, posVec, negVec) {
+            // We use dot product on normalized vectors as proxy for cosine similarity
+            // Since vectors are Int8, we unscale them on the fly or just compare raw dots
+            // Raw dot is fine for relative ranking
+            let dPos = 0, dNeg = 0;
+            let offset = idx * dim;
+            for(let i=0; i<dim; i++) {
+                let val = vectors[offset+i] / 127.0;
+                dPos += val * posVec[i];
+                dNeg += val * negVec[i];
+            }
+            return dPos - dNeg;
+        }
+
+        self.onmessage = (e) => {
+            const { type, payload } = e.data;
+
+            if (type === 'LOAD_BIN') {
+                try {
+                    const dv = new DataView(payload.buffer);
+                    if (String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3)) !== 'ATLS') 
+                        throw new Error("Invalid Header");
+                    const fileCount = dv.getUint32(4, true); 
+                    vectors = new Int8Array(payload.buffer, 16);
+                    count = fileCount;
+                    postMessage({ type: 'STATUS', msg: `Atlas Loaded: ${count.toLocaleString()} Words` });
+                } catch(err) { postMessage({ type: 'ERROR', msg: err.message }); }
+            }
+
+            if (type === 'SET_AXES') {
+                const { indices } = payload;
+                AXIS_INDICES = indices;
+                // Cache axis vectors for speed
+                for(const [k, idx] of Object.entries(indices)) {
+                    if(idx !== -1) AXIS_VECS[k] = getVec(idx);
+                }
+            }
+
+            if (type === 'SEARCH') {
+                if (!vectors) return;
+                const { queryVec, k } = payload; 
+                
+                // 1. Search Neighbors
+                const scores = new Float32Array(count);
+                for(let i=0; i<count; i++) scores[i] = dot(i, queryVec);
+
+                const indices = new Int32Array(count);
+                for(let i=0; i<count; i++) indices[i] = i;
+                indices.sort((a, b) => scores[b] - scores[a]);
+
+                const results = [];
+                // Fetch 5x K to allow for filtering
+                for(let i=0; i<k*5; i++) {
+                    const idx = indices[i];
+                    
+                    // 2. Project onto Compass Axes
+                    let x = 0, y = 0;
+                    
+                    if(AXIS_VECS.formal && AXIS_VECS.casual) 
+                        x = project(idx, AXIS_VECS.formal, AXIS_VECS.casual);
+                    
+                    if(AXIS_VECS.intense && AXIS_VECS.mild)
+                        y = project(idx, AXIS_VECS.intense, AXIS_VECS.mild);
+
+                    results.push({ idx, score: scores[idx], x, y });
+                }
+                
+                postMessage({ type: 'RESULTS', results });
+            }
+        };
+    </script>
+
+    <script type="text/babel" data-presets="react">
+        const { useState, useEffect, useRef } = React;
+        const { motion, AnimatePresence } = window.Motion;
+
+        // --- AXIS CONFIGURATION ---
+        const ANCHORS = ["formal", "casual", "intense", "mild"];
+
+        const useAtlas = () => {
+            const worker = useRef(null);
+            const [meta, setMeta] = useState({data:[]});
+            const [isLoaded, setIsLoaded] = useState(false);
+            const [results, setResults] = useState([]);
+            const [loadStep, setLoadStep] = useState("Initializing...");
+
+            useEffect(() => {
+                const blob = new Blob([document.getElementById('worker-js').textContent], {type: 'text/javascript'});
+                worker.current = new Worker(URL.createObjectURL(blob));
+                worker.current.onmessage = (e) => {
+                    if(e.data.type === 'STATUS') setIsLoaded(true);
+                    if(e.data.type === 'RESULTS') setResults(e.data.results);
+                };
+
+                const load = async () => {
+                    setLoadStep("Reading Dictionary...");
+                    const m = await fetch('meta.json').then(r => r.json());
+                    setMeta(m);
+                    
+                    setLoadStep("Calibrating Compass...");
+                    const indices = {};
+                    ANCHORS.forEach(w => {
+                        const idx = m.data.findIndex(d => d.w.toLowerCase() === w && d.l === 'en');
+                        indices[w] = idx;
+                    });
+
+                    setLoadStep("Loading Matrix...");
+                    const b = await fetch('atlas.bin').then(r => r.arrayBuffer());
+                    worker.current.postMessage({ type: 'LOAD_BIN', payload: { buffer: b } }, [b]);
+                    
+                    setTimeout(() => {
+                        worker.current.postMessage({ type: 'SET_AXES', payload: { indices } });
+                    }, 200);
+                };
+                load();
+                return () => worker.current.terminate();
+            }, []);
+
+            const search = (vec) => {
+                if(worker.current) worker.current.postMessage({ type: 'SEARCH', payload: { queryVec: vec, k: 50 } });
+            };
+            return { meta, isLoaded, search, results, loadStep };
+        };
+
+        const useAI = () => {
+            const [extractor, setExtractor] = useState(null);
+            useEffect(() => {
+                window.AI.pipeline('feature-extraction', 'Xenova/paraphrase-multilingual-MiniLM-L12-v2', { quantized: true })
+                    .then(pipe => setExtractor(() => pipe));
+            }, []);
+            return { 
+                embed: async (t) => (await extractor(t, { pooling: 'mean', normalize: true })).data,
+                isReady: !!extractor 
+            };
+        };
+
+        // --- UI COMPONENTS ---
+
+        const AxisLines = () => (
+            <div className="grid-layer">
+                {/* Crosshairs */}
+                <div className="absolute top-0 bottom-0 left-1/2 w-px bg-white/20" />
+                <div className="absolute left-0 right-0 top-1/2 h-px bg-white/20" />
+                
+                {/* Labels */}
+                <div className="axis-label top-8 left-1/2 -translate-x-1/2">Intense</div>
+                <div className="axis-label bottom-24 left-1/2 -translate-x-1/2">Mild</div>
+                <div className="axis-label left-8 top-1/2 -translate-y-1/2">Casual</div>
+                <div className="axis-label right-8 top-1/2 -translate-y-1/2">Formal</div>
+            </div>
+        );
+
+        const App = () => {
+            const ai = useAI();
+            const atlas = useAtlas();
+            const [query, setQuery] = useState("");
+            const [nodes, setNodes] = useState([]);
+            const [centerWord, setCenterWord] = useState(null);
+            const [hoveredNode, setHoveredNode] = useState(null);
+
+            const handleSearch = async (text) => {
+                if(!text.trim() || !ai.isReady) return;
+                const vec = await ai.embed(text);
+                atlas.search(vec);
+                setQuery(""); // Clear input on search
+            };
+
+            // --- THE COMPASS LOGIC ---
+            useEffect(() => {
+                if(atlas.results.length > 0) {
+                    const raw = atlas.results;
+                    
+                    // 1. Identify Center (Top Match)
+                    const centerIdx = raw[0].idx;
+                    const centerMeta = atlas.meta.data[centerIdx];
+                    setCenterWord(centerMeta);
+                    setHoveredNode(null);
+
+                    // 2. Filter & Relative Offset
+                    const centerX = raw[0].x;
+                    const centerY = raw[0].y;
+                    
+                    let filtered = [];
+                    const unique = new Set([centerMeta.w.toLowerCase()]);
+
+                    for(const r of raw) {
+                        const m = atlas.meta.data[r.idx];
+                        
+                        // STRICT ENGLISH FILTER
+                        if(m.l !== 'en') continue; 
+                        
+                        // Dedup
+                        if(!unique.has(m.w.toLowerCase()) && m.w.length > 2) {
+                            unique.add(m.w.toLowerCase());
+                            
+                            // CALCULATE RELATIVE POSITION
+                            // This ensures the searched word is (0,0)
+                            // and neighbors are placed relative to it
+                            filtered.push({ 
+                                ...m, 
+                                x: r.x - centerX,
+                                y: r.y - centerY,
+                                id: r.idx
+                            });
+                        }
+                        if(filtered.length >= 35) break;
+                    }
+
+                    // 3. Auto-Zoom (Normalization)
+                    // Find the bounds of this specific semantic cluster to fill screen
+                    const maxX = Math.max(...filtered.map(n => Math.abs(n.x))) || 1;
+                    const maxY = Math.max(...filtered.map(n => Math.abs(n.y))) || 1;
+
+                    setNodes(filtered.map(n => ({
+                        ...n,
+                        x: (n.x / maxX) * 0.85, // Fill 85% width
+                        y: -(n.y / maxY) * 0.7  // Fill 70% height (inverted Y)
+                    })));
+                }
+            }, [atlas.results]);
+
+            // Footer Display Logic
+            const activeDisplay = hoveredNode || centerWord;
+
+            if(!ai.isReady || !atlas.isLoaded) return (
+                <div className="h-screen flex items-center justify-center bg-black gap-4">
+                    <div className="w-8 h-8 border-t-2 border-white rounded-full animate-spin"/>
+                    <div className="text-white/40 text-xs tracking-widest uppercase">
+                        {ai.isReady ? atlas.loadStep : "Loading AI..."}
+                    </div>
+                </div>
+            );
+
+            return (
+                <div className="relative w-full h-screen bg-black overflow-hidden font-sans selection:bg-white/20">
+                    
+                    <AxisLines />
+
+                    {/* SEARCH INPUT (Floating Top) */}
+                    <div className="absolute top-0 left-0 w-full flex justify-center z-50 p-6 pointer-events-none">
+                        <div className="pointer-events-auto bg-black/80 backdrop-blur-xl border border-white/20 rounded-full flex items-center p-2 w-full max-w-md shadow-2xl transition-all focus-within:border-white/50">
+                            <div className="pl-4 pr-2 text-white/30"><i data-lucide="search" className="w-4 h-4"/></div>
+                            <input 
+                                className="bg-transparent border-none outline-none text-white px-2 py-2 w-full placeholder-white/20 text-lg font-light"
+                                placeholder="Search a word (e.g. Mad)..."
+                                value={query}
+                                onChange={e => setQuery(e.target.value)}
+                                onKeyDown={e => e.key === 'Enter' && handleSearch(query)}
+                            />
+                            {(query || centerWord) && (
+                                <button onClick={() => { setQuery(""); setCenterWord(null); setNodes([]); }} className="p-2 hover:bg-white/10 rounded-full transition-colors">
+                                    <i data-lucide="x" className="w-4 h-4 text-white/50"/>
+                                </button>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* CANVAS */}
+                    <div className="absolute inset-0 flex items-center justify-center">
+                        <AnimatePresence>
+                            {/* CENTER ANCHOR */}
+                            {centerWord && (
+                                <motion.div 
+                                    key="center"
+                                    initial={{ opacity: 0, scale: 0.8 }}
+                                    animate={{ opacity: 1, scale: 1 }}
+                                    className="absolute z-40 flex flex-col items-center pointer-events-none"
+                                >
+                                    <div className="text-5xl font-bold text-white tracking-tighter drop-shadow-2xl">
+                                        {centerWord.w}
+                                    </div>
+                                    <div className="w-2 h-2 bg-white rounded-full mt-2 shadow-[0_0_20px_white]"/>
+                                </motion.div>
+                            )}
+
+                            {/* NEIGHBORS */}
+                            {nodes.map((n, i) => (
+                                <motion.div
+                                    key={n.w}
+                                    initial={{ opacity: 0, scale: 0 }}
+                                    animate={{ 
+                                        left: `${50 + n.x * 50}%`, // *50 because x is -1 to 1 
+                                        top: `${50 + n.y * 50}%`, 
+                                        opacity: 1, 
+                                        scale: 1 
+                                    }}
+                                    transition={{ duration: 0.5, delay: i * 0.01 }}
+                                    className="absolute transform -translate-x-1/2 -translate-y-1/2 group z-30 cursor-pointer"
+                                    onMouseEnter={() => setHoveredNode(n)}
+                                    onMouseLeave={() => setHoveredNode(null)}
+                                    onClick={() => { setQuery(n.w); handleSearch(n.w); }}
+                                >
+                                    <div className={`
+                                        flex flex-col items-center px-3 py-1.5 rounded-lg transition-all duration-300
+                                        ${hoveredNode === n ? 'bg-white text-black scale-110 shadow-lg z-50' : 'bg-black/40 text-white/70 hover:bg-white/10'}
+                                        backdrop-blur-sm border border-white/5
+                                    `}>
+                                        <span className="text-sm font-medium whitespace-nowrap">
+                                            {n.w}
+                                        </span>
+                                    </div>
+                                </motion.div>
+                            ))}
+                        </AnimatePresence>
+                    </div>
+
+                    {/* DEFINITION FOOTER (Fixed Bottom) */}
+                    <AnimatePresence>
+                        {activeDisplay && (
+                            <motion.div 
+                                initial={{y: 100}} animate={{y: 0}}
+                                className="absolute bottom-0 left-0 w-full z-50 pointer-events-none"
+                            >
+                                <div className="glass-panel w-full p-8 md:p-10 text-center flex flex-col items-center justify-center min-h-[200px]">
+                                    <div className="flex items-center gap-3 mb-3 opacity-50">
+                                        <span className="text-[10px] uppercase tracking-widest text-emerald-400 font-bold">
+                                            {activeDisplay.l.toUpperCase()}
+                                        </span>
+                                        {hoveredNode && <span className="text-[10px] uppercase tracking-widest text-white/40">• {hoveredNode === centerWord ? "ROOT" : "NEIGHBOR"}</span>}
+                                    </div>
+                                    
+                                    <h3 className="text-3xl font-light text-white mb-3">{activeDisplay.w}</h3>
+                                    
+                                    <p className="text-base text-white/70 font-light leading-relaxed max-w-2xl">
+                                        {activeDisplay.d || "Definition not available."}
+                                    </p>
+                                </div>
+                            </motion.div>
+                        )}
+                    </AnimatePresence>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
